@@ -325,6 +325,72 @@ fn render_items(items: &[Value], flags: &mut RenderFlags) -> String {
     records.join("\n\n")
 }
 
+pub const NATIVE_PROMPT_BUDGET: usize = 180_000;
+
+const RECORD_HEADS: [&str; 4] = [
+    "\n\n[User]\n",
+    "\n\n[Assistant",
+    "\n\n[Tool result id=",
+    "\n\n[System]\n",
+];
+
+pub fn fit_prompt(head: &str, body: &str) -> String {
+    fit_prompt_to(head, body, NATIVE_PROMPT_BUDGET)
+}
+
+pub(crate) fn fit_prompt_to(head: &str, body: &str, budget: usize) -> String {
+    let sep = if head.is_empty() { "" } else { "\n\n" };
+    if head.len() + sep.len() + body.len() <= budget {
+        return format!("{head}{sep}{body}");
+    }
+    let room = budget
+        .saturating_sub(head.len() + sep.len() + 120)
+        .max(budget / 4)
+        .min(body.len());
+    let records = split_records(body);
+    let first = records.first().copied().unwrap_or_default();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = first.len();
+    for r in records.iter().skip(1).rev() {
+        if used + r.len() + 2 > room {
+            break;
+        }
+        used += r.len() + 2;
+        kept.push(r);
+    }
+    kept.reverse();
+    let omitted = body.len().saturating_sub(used);
+    format!(
+        "{head}{sep}{first}\n\n[{omitted} bytes of earlier tool output omitted to fit the native prompt limit; the task above and the newest records below are intact]\n\n{}",
+        kept.join("\n\n")
+    )
+}
+
+fn split_records(body: &str) -> Vec<&str> {
+    let mut starts: Vec<usize> = Vec::new();
+    for h in RECORD_HEADS {
+        let mut from = 0;
+        while let Some(k) = body[from..].find(h) {
+            starts.push(from + k + 2);
+            from += k + h.len();
+        }
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    if starts.first().copied() != Some(0) {
+        starts.insert(0, 0);
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for (i, start) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(body.len());
+        let rec = body[*start..end].trim_end_matches('\n');
+        if !rec.is_empty() {
+            out.push(rec);
+        }
+    }
+    out
+}
+
 /// The `finish` envelope every turn's `--json-schema` pins: a constant,
 /// so a child spawned idle for a re-warmed session ([`crate::live::rewarm`])
 /// carries the same one its next turn expects.
@@ -998,7 +1064,7 @@ pub fn fold_lines(
     }
     let answer = crate::guard::strip_reasoning(&guarded).trim().to_string();
     let has_calls = !wanted.is_empty();
-    if answer.is_empty() && !(has_calls && (cut.is_some() || salvage.is_some())) {
+    if answer.is_empty() && !has_calls {
         return Err("incomplete native response: finish carried no answer".into());
     }
     say(format!("…{answer}"));
