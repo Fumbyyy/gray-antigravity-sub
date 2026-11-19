@@ -83,7 +83,7 @@ pub struct Record {
     pub reply_text: String,
     #[serde(default)]
     pub home: String,
-    /// Unix seconds when written; restores the idle/keepalive clocks.
+    /// Unix seconds when written; restores the idle clock.
     #[serde(default)]
     pub saved_at: u64,
 }
