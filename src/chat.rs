@@ -327,8 +327,6 @@ fn render_items(items: &[Value], flags: &mut RenderFlags) -> String {
 
 pub const NATIVE_PROMPT_BUDGET: usize = 180_000;
 
-const SNAP_LIMIT: usize = 8_000;
-
 const RECORD_HEADS: [&str; 4] = [
     "\n\n[User]\n",
     "\n\n[Assistant",
@@ -349,20 +347,48 @@ pub(crate) fn fit_prompt_to(head: &str, body: &str, budget: usize) -> String {
         .saturating_sub(head.len() + sep.len() + 120)
         .max(budget / 4)
         .min(body.len());
-    let mut start = body.len() - room;
-    while !body.is_char_boundary(start) {
-        start += 1;
+    let records = split_records(body);
+    let first = records.first().copied().unwrap_or_default();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = first.len();
+    for r in records.iter().skip(1).rev() {
+        if used + r.len() + 2 > room {
+            break;
+        }
+        used += r.len() + 2;
+        kept.push(r);
     }
-    let cut = RECORD_HEADS
-        .iter()
-        .filter_map(|h| body[start..].find(h))
-        .min()
-        .filter(|k| *k <= SNAP_LIMIT)
-        .map_or(start, |k| start + k + 2);
+    kept.reverse();
+    let omitted = body.len().saturating_sub(used);
     format!(
-        "{head}{sep}[Earlier conversation omitted: {cut} bytes did not fit the native prompt limit]\n\n{}",
-        &body[cut..]
+        "{head}{sep}{first}\n\n[{omitted} bytes of earlier tool output omitted to fit the native prompt limit; the task above and the newest records below are intact]\n\n{}",
+        kept.join("\n\n")
     )
+}
+
+fn split_records(body: &str) -> Vec<&str> {
+    let mut starts: Vec<usize> = Vec::new();
+    for h in RECORD_HEADS {
+        let mut from = 0;
+        while let Some(k) = body[from..].find(h) {
+            starts.push(from + k + 2);
+            from += k + h.len();
+        }
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    if starts.first().copied() != Some(0) {
+        starts.insert(0, 0);
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for (i, start) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(body.len());
+        let rec = body[*start..end].trim_end_matches('\n');
+        if !rec.is_empty() {
+            out.push(rec);
+        }
+    }
+    out
 }
 
 /// The `finish` envelope every turn's `--json-schema` pins: a constant,
@@ -645,10 +671,17 @@ impl TurnIsolation {
     /// session after a restart. Verified: a staged HOME with only the
     /// token link + skeleton authenticates and answers. Fails closed when
     /// the token file is absent.
-    pub fn stage() -> Result<Self, String> {
-        if !has_auth_store() {
-            return Err(setup::LOGIN_HINT.to_string());
-        }
+    pub fn stage(account_home: Option<&std::path::Path>) -> Result<Self, String> {
+        let token = match account_home {
+            Some(home) => Some(use_token(Some(home)).ok_or_else(|| {
+                format!(
+                    "the picked antigravity account has no login in {}",
+                    home.display()
+                )
+            })?),
+            None if !has_auth_store() => return Err(setup::LOGIN_HINT.to_string()),
+            None => credential_file(),
+        };
         let stage = tempfile::Builder::new()
             .prefix("antigravity-sub-")
             .tempdir()
@@ -656,7 +689,7 @@ impl TurnIsolation {
         let home = stage.path().to_path_buf();
         let cli_dir = home.join(".gemini").join("antigravity-cli");
         std::fs::create_dir_all(&cli_dir).map_err(|e| format!("staging dir: {e}"))?;
-        if let Some(token_src) = credential_file() {
+        if let Some(token_src) = token {
             stage_link(&token_src, &cli_dir.join("antigravity-oauth-token"))?;
         }
         if let Some(bin_src) = std::env::var_os("HOME")
@@ -719,8 +752,98 @@ pub fn credential_file() -> Option<std::path::PathBuf> {
 
 pub fn has_auth_store() -> bool {
     credential_file().is_some()
+        || crate::accounts::has_token()
         || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty())
         || cfg!(target_os = "macos")
+}
+
+pub fn use_token(account_home: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    match account_home {
+        Some(home) => crate::accounts::token_of(home),
+        None => crate::accounts::probe_home()
+            .and_then(|home| crate::accounts::token_of(&home))
+            .or_else(credential_file),
+    }
+}
+
+pub enum Verdict {
+    Unauthorized,
+    RateLimited {
+        retry_after: Option<std::time::Duration>,
+    },
+}
+
+pub fn verdict_of(detail: &str) -> Option<Verdict> {
+    let low = detail.to_lowercase();
+    let auth = [
+        "unauthenticated",
+        "authentication required",
+        "authentication failed or timed out",
+        "(401)",
+        "401 ",
+        "code 401",
+        "invalid_grant",
+    ]
+    .iter()
+    .any(|w| low.contains(w));
+    if auth {
+        return Some(Verdict::Unauthorized);
+    }
+    let quota = [
+        "resource_exhausted",
+        "(429)",
+        "code 429",
+        "individual quota reached",
+        "quota exceeded",
+        "rate limit",
+    ]
+    .iter()
+    .any(|w| low.contains(w));
+    quota.then(|| Verdict::RateLimited {
+        retry_after: resets_in(&low),
+    })
+}
+
+fn duration_secs(text: &str) -> Option<u64> {
+    let mut total = 0u64;
+    let mut any = false;
+    let mut n = 0u64;
+    let mut digits = false;
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            n = n
+                .saturating_mul(10)
+                .saturating_add(u64::from(c as u8 - b'0'));
+            digits = true;
+            continue;
+        }
+        let unit = match c {
+            'd' => 86_400,
+            'h' => 3_600,
+            'm' => 60,
+            's' => 1,
+            _ => {
+                if digits {
+                    return None;
+                }
+                continue;
+            }
+        };
+        if digits {
+            total = total.saturating_add(n.saturating_mul(unit));
+            any = true;
+            n = 0;
+            digits = false;
+        }
+    }
+    (any && total > 0).then_some(total)
+}
+
+fn resets_in(low: &str) -> Option<std::time::Duration> {
+    const MAX_RESET: u64 = 8 * 24 * 3600;
+    let (_, rest) = low.split_once("resets in ")?;
+    let secs = duration_secs(rest.trim_start())?;
+    Some(std::time::Duration::from_secs(secs.min(MAX_RESET)))
 }
 
 fn json_value_prefix(s: &str) -> Option<(Value, usize)> {
@@ -850,31 +973,23 @@ pub fn fold_lines(
             })
             .unwrap_or("")
             .to_string();
-        if detail.contains("authentication failed or timed out")
-            || detail.contains("Authentication required")
-        {
-            return Err(format!(
-                "Antigravity CLI has no usable login here; run `agy` once and complete the Google sign-in (native: {detail})"
-            ));
-        }
-        if detail.contains("Individual quota reached")
-            || detail.contains("RESOURCE_EXHAUSTED")
-            || detail.contains("code 429")
-        {
-            crate::usage::note_quota_event(&detail);
-            return Err(format!("Antigravity quota exhausted (native: {detail})"));
+        match verdict_of(&detail) {
+            Some(Verdict::Unauthorized) => {
+                return Err(format!(
+                    "Antigravity CLI has no usable login here; run `agy` once and complete the Google sign-in (native: {detail})"
+                ));
+            }
+            Some(Verdict::RateLimited { .. }) => {
+                crate::usage::note_quota_event(&detail);
+                return Err(format!("Antigravity quota exhausted (native: {detail})"));
+            }
+            None => {}
         }
         if !detail.is_empty() {
             return Err(format!("native request failed: {detail}"));
         }
         return Err("native request failed (nonzero exit without a success result)".into());
     }
-    let mut usage = Usage::default();
-    // Per-call usage from this turn's DONE steps. `result.usage` is a running
-    // total over the whole (pooled, multi-turn) agy conversation, so it is
-    // only the fallback: context size is the LAST call's input, output is the
-    // sum of this turn's calls.
-    let mut step_usage: Option<Usage> = None;
     let mut finish_args: Option<Value> = None;
     // Schema-driven finish: when the model answers as structured output
     // instead of calling the finish tool, agy auto-closes with a bare
@@ -907,14 +1022,6 @@ pub fn fold_lines(
             }
             "step_update" => {
                 let su = line.get("step_update");
-                if let Some(u) = su.and_then(|su| su.get("usage")) {
-                    let call = map_usage(u);
-                    let out = step_usage.as_ref().map_or(0, |p| p.output_tokens);
-                    step_usage = Some(Usage {
-                        output_tokens: out + call.output_tokens,
-                        ..call
-                    });
-                }
                 let step_type = su
                     .and_then(|su| su.get("step_type"))
                     .and_then(Value::as_str)
@@ -959,9 +1066,6 @@ pub fn fold_lines(
                 }
             }
             "result" => {
-                if let Some(u) = line.pointer("/result/usage").or_else(|| line.get("usage")) {
-                    usage = map_usage(u);
-                }
                 if let Some(so) = line.pointer("/result/structured_output")
                     && !so.is_null()
                 {
@@ -974,9 +1078,7 @@ pub fn fold_lines(
     // `result.structured_output` is the full envelope; the step_update echo
     // is a display copy agy clips to 512 chars + "…" (answer AND calls), so
     // it is only the fallback for builds that never emit structured_output.
-    if let Some(u) = step_usage {
-        usage = u;
-    }
+    let usage = turn_usage(lines);
     let fired = finish_step || finish_args.is_some();
     let args = match (fired, structured) {
         (true, structured) => structured.or(finish_args),
@@ -1048,17 +1150,28 @@ pub fn fold_lines(
     // echoed history ambiguous (and collide in the host transcript).
     let call_tag = rand_hex(8);
     for (i, want) in wanted.iter().enumerate() {
-        let tool = want.get("tool").and_then(Value::as_str).unwrap_or("");
-        if !names.contains(&tool.to_string()) {
-            return Err(format!(
-                "native requested a tool outside the current host inventory: {tool:?}"
-            ));
-        }
+        let raw_tool = want.get("tool").and_then(Value::as_str).unwrap_or("");
+        // A tool outside the advertised `names` list must never fail the
+        // turn (which triggers host retries + cold replays) or silently
+        // execute a policy-filtered host tool: rewrite to `native__…` so
+        // the host answers "Tool '...' does not exist." as a normal tool
+        // result on the still-warm session.
+        let tool = if names.iter().any(|n| n == raw_tool) {
+            raw_tool.to_string()
+        } else if let Some(name) = garbled_name(raw_tool, names) {
+            eprintln!("antigravity-sub: native requested {raw_tool:?}; repaired to {name:?}");
+            name
+        } else {
+            eprintln!(
+                "antigravity-sub: native requested {raw_tool:?}, outside the host inventory; forwarding as native__"
+            );
+            native_name(raw_tool)
+        };
         let call_args = want.get("args").cloned().unwrap_or(json!({}));
         // Deterministic within the fold; unique across the session.
         let id = format!("call_{call_tag}_{}", i + 1);
         let args_str = serde_json::to_string(&call_args).unwrap_or_else(|_| "{}".into());
-        calls.push((id, tool.to_string(), args_str));
+        calls.push((id, tool, args_str));
     }
     let stop = if calls.is_empty() {
         "completed".to_string()
@@ -1127,6 +1240,37 @@ pub fn fold_lines(
     Ok((sse, natives, answer, calls, usage, stop))
 }
 
+fn garbled_name(raw: &str, names: &[String]) -> Option<String> {
+    names
+        .iter()
+        .filter(|n| {
+            raw.strip_prefix(n.as_str()).is_some_and(|rest| {
+                rest.starts_with(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+            })
+        })
+        .max_by_key(|n| n.len())
+        .cloned()
+}
+
+/// `native__`-prefixed form of a tool name outside the advertised host
+/// inventory — sanitized, capped at 50 chars, and unable to collide with
+/// a real tool, so the host answers "does not exist" instead of crashing
+/// the turn.
+fn native_name(raw: &str) -> String {
+    let mut name = String::from("native__");
+    for c in raw.chars() {
+        if name.len() >= 50 {
+            break;
+        }
+        name.push(if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            c
+        } else {
+            '_'
+        });
+    }
+    name
+}
+
 pub(crate) fn conversation_of(line: &Value) -> String {
     line.get("conversation_id")
         .and_then(Value::as_str)
@@ -1154,12 +1298,54 @@ pub struct Usage {
     /// no cache writes.
     pub cached_tokens: usize,
 }
+pub(crate) fn turn_usage(lines: &[Value]) -> Usage {
+    let mut calls = lines.iter().filter_map(|line| {
+        let step = line.get("step_update")?;
+        if step
+            .get("state")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status.eq_ignore_ascii_case("active"))
+        {
+            return None;
+        }
+        let usage = map_usage(step.get("usage")?);
+        (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(usage)
+    });
+    if let Some(first) = calls.next() {
+        return calls.fold(first, |previous, mut current| {
+            current.output_tokens = previous.output_tokens.saturating_add(current.output_tokens);
+            if current.input_tokens == 0 {
+                current.input_tokens = previous.input_tokens;
+                current.cached_tokens = previous.cached_tokens;
+            }
+            current
+        });
+    }
+    lines
+        .iter()
+        .rev()
+        .find_map(|line| line.pointer("/result/usage").or_else(|| line.get("usage")))
+        .map(map_usage)
+        .unwrap_or_default()
+}
 
 pub fn map_usage(u: &Value) -> Usage {
-    let input = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as usize;
-    let output = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let input = u
+        .get("input_tokens")
+        .or_else(|| u.get("promptTokenCount"))
+        .or_else(|| u.get("prompt_token_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let output = u
+        .get("output_tokens")
+        .or_else(|| u.get("candidatesTokenCount"))
+        .or_else(|| u.get("candidates_token_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
     let thinking = u
         .get("thinking_tokens")
+        .or_else(|| u.get("thoughtsTokenCount"))
+        .or_else(|| u.get("thoughts_token_count"))
         .and_then(Value::as_u64)
         .unwrap_or(0) as usize;
     // Cache-read field spellings differ across upstreams. Flat counters

@@ -178,7 +178,7 @@ pub fn probe_login() -> LoginState {
         return LoginState::Unknown;
     }
     #[cfg(unix)]
-    if let Some(token_src) = crate::chat::credential_file()
+    if let Some(token_src) = crate::chat::use_token(None)
         && std::os::unix::fs::symlink(&token_src, cli_dir.join("antigravity-oauth-token")).is_err()
     {
         return LoginState::Unknown;

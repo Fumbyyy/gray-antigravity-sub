@@ -9,11 +9,9 @@ use crate::{setup, usage};
 /// `~/.gemini/google_accounts.json` — Google's own "active account" file,
 /// metadata only (no tokens): `{active: email, old: [emails]}`.
 fn google_account() -> Option<String> {
-    let home = std::env::var_os("HOME")?;
-    let text = std::fs::read_to_string(
-        std::path::PathBuf::from(home).join(".gemini/google_accounts.json"),
-    )
-    .ok()?;
+    let home = crate::accounts::probe_home()
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))?;
+    let text = std::fs::read_to_string(home.join(".gemini/google_accounts.json")).ok()?;
     serde_json::from_str::<Value>(&text).ok()?["active"]
         .as_str()
         .map(str::to_string)

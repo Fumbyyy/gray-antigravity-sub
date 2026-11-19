@@ -53,7 +53,7 @@ type Relays = relay::Intents;
 
 fn cli_help() -> String {
     "antigravity-sub — Antigravity subscription provider for gray\n\
-     usage: antigravity-sub manifest | sidecar | status | tools [all|bash|+name|-name|name …] | account <verb>\n\
+     usage: antigravity-sub manifest | sidecar | status | tools [all|default|bash|+name|-name|name …] | account <verb>\n\
      slash:  /antigravity · /antigravity tools … · /antigravity account …"
         .to_string()
 }
@@ -81,7 +81,8 @@ async fn main() -> anyhow::Result<()> {
                 .skip(2)
                 .map(|s| s.to_string_lossy().into_owned())
                 .collect();
-            match accounts::command(&args) {
+            let interactive = std::io::IsTerminal::is_terminal(&std::io::stdout());
+            match accounts::command(&args, interactive) {
                 Ok(text) => {
                     println!("{text}");
                     return Ok(());
@@ -302,12 +303,14 @@ async fn chat_turn(relays: &Relays, params: Value) -> Result<Value, ProviderRpcE
     if !antigravity_sub::chat::has_auth_store() {
         return Err(ProviderRpcError::Unavailable(setup::LOGIN_HINT.into()));
     }
+    let account = accounts::pick().map_err(ProviderRpcError::Unavailable)?;
     let bearer = format!("antigravity-sub-{}", hex_id());
     // The relay server is per-turn: bind now so the host gets a live port.
     // The admitted POST carries the Responses body; the handler translates,
     // spawns native, folds SSE and streams it back.
     let intent = relay::RelayIntent {
         model: model.clone(),
+        account,
     };
     relays
         .lock()
