@@ -363,22 +363,6 @@ pub fn note_failure(label: &str, detail: &str) {
     });
 }
 
-pub fn note_failure_home(home: Option<&Path>, detail: &str) {
-    let Some(home) = home else {
-        return;
-    };
-    let store = load();
-    let Some(label) = store
-        .accounts
-        .iter()
-        .find(|a| a.home == home)
-        .map(|a| a.label.clone())
-    else {
-        return;
-    };
-    note_failure(&label, detail);
-}
-
 pub fn probe_home() -> Option<PathBuf> {
     let store = load();
     let first = store.accounts.first()?;
