@@ -15,6 +15,7 @@
 //! `AGY_SUB_MODELS_TIMEOUT_SECS` (default 10) the child budget.
 
 use std::io::Read;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -163,13 +164,21 @@ fn fetch(timeout: Duration) -> Option<Vec<DiscoveredModel>> {
 }
 
 pub fn capture(args: &[&str], timeout: Duration) -> Option<String> {
+    capture_in(args, timeout, None)
+}
+
+pub fn capture_in(args: &[&str], timeout: Duration, home: Option<&Path>) -> Option<String> {
     let binary = crate::setup::resolve_command()?;
     let mut child = Command::new(binary)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .envs(crate::setup::child_env())
+        .envs(home.map_or_else(crate::setup::child_env, |h| {
+            let mut env = crate::setup::child_env();
+            env.push(("HOME".to_string(), h.display().to_string()));
+            env
+        }))
         // Insurance against an auth flow: `agy` calls `xdg-open`
         // directly (ignores `BROWSER`), and `xdg-open` with no display
         // and `BROWSER=/bin/true` exits without touching Firefox.

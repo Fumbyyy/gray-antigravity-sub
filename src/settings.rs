@@ -161,7 +161,7 @@ fn valid_entry(entry: &str) -> bool {
 /// picker) takes it.
 pub fn command(argv: &[String]) -> String {
     match argv.first().map(String::as_str) {
-        Some("account") => match crate::accounts::command(&argv[1..]) {
+        Some("account") => match crate::accounts::command(&argv[1..], false) {
             Ok(text) => text,
             Err(e) => e,
         },
@@ -179,7 +179,7 @@ const USAGE: &str = "\
   /antigravity tools bash     bash only
   /antigravity tools +name    also allow one tool or prefix*, e.g. +mcp__*
   /antigravity tools -name    remove one
-/antigravity account — the Antigravity login: list · usage (one keyring login; no pool yet).
+/antigravity account — the Antigravity logins: list · status · usage · use · strategy.
 Same from a shell: `gray antigravity-sub tools …`.";
 
 fn status_line(policy: &ToolPolicy) -> String {

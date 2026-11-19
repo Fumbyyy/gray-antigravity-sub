@@ -81,6 +81,8 @@ pub struct Record {
     pub reply_call_ids: Vec<String>,
     #[serde(default)]
     pub reply_text: String,
+    #[serde(default)]
+    pub home: String,
     /// Unix seconds when written; restores the idle/keepalive clocks.
     #[serde(default)]
     pub saved_at: u64,
@@ -193,6 +195,22 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+pub(crate) fn lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    private_dir(path.parent().unwrap_or(Path::new(".")))?;
+    let mut lock = path.as_os_str().to_os_string();
+    lock.push(".lock");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(PathBuf::from(lock))?;
+    file.lock()?;
+    Ok(file)
 }
 
 fn private_dir(dir: &Path) -> std::io::Result<()> {

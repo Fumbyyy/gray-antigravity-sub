@@ -58,6 +58,7 @@
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -79,11 +80,12 @@ const REAPER_SWEEP: Duration = Duration::from_secs(60);
 /// upstream contact.
 const KEEPALIVE_SWEEP: Duration = Duration::from_secs(5);
 /// Fire a keepalive once the session's last settled upstream contact is
-/// this old — comfortably under the implicit prompt-cache TTL, so the
-/// next continuation still hits a warm prefix.
-const KEEPALIVE_AFTER: Duration = Duration::from_secs(25);
-/// Stop warming once the user has been idle this long: past ~3 pings the
-/// pings cost more than the one cold resend they would prevent.
+/// this old — just under the implicit prompt-cache TTL, so a ping
+/// refreshes a cache that has actually lapsed rather than one still warm.
+const KEEPALIVE_AFTER: Duration = Duration::from_secs(30);
+const KEEPALIVE_TOO_LATE: Duration = Duration::from_secs(45);
+/// Stop warming once the user has been idle this long: a window left this
+/// long is abandoned, and the reaper's `IDLE_TTL` owns the session next.
 const KEEPALIVE_IDLE_MAX: Duration = Duration::from_secs(120);
 const KEEPALIVE_MIN_TOKENS: usize = 80_000;
 /// A turn waits this long for a matching session to come back from a
@@ -152,6 +154,11 @@ pub struct LiveSession {
     /// Keepalive pings absorbed; debug trace only — never into `absorbed`,
     /// the reply echo, or host usage accounting.
     keepalive_turns: u32,
+    /// Upstream cache last answered a settled turn: cleared by a ping that
+    /// came back fully cold, re-armed by a real turn. A cold ping means
+    /// the prefix is no longer cached, so every later ping would re-bill
+    /// the whole transcript to warm a cache nobody reads.
+    cache_live: bool,
     /// Fail-closed latch on a failed ping; the next real turn re-arms it.
     keepalive_disabled: bool,
     pingable: bool,
@@ -162,6 +169,7 @@ pub struct LiveSession {
     /// stale record, so the turn falls back to a fresh child instead of
     /// failing.
     rewarmed: bool,
+    account: Option<PathBuf>,
     /// Keeps the staged HOME alive for the child's whole life.
     _isolation: TurnIsolation,
 }
@@ -174,6 +182,7 @@ struct Warming {
     arc: Arc<Mutex<LiveSession>>,
     native_model: String,
     system: String,
+    account: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -186,10 +195,12 @@ struct Pool {
 }
 
 impl Pool {
-    fn warming_for(&self, turn: &PreparedTurn) -> bool {
-        self.warming
-            .iter()
-            .any(|w| w.native_model == turn.native_model && w.system == turn.system)
+    fn warming_for(&self, turn: &PreparedTurn, account: Option<&Path>) -> bool {
+        self.warming.iter().any(|w| {
+            w.native_model == turn.native_model
+                && w.system == turn.system
+                && w.account.as_deref() == account
+        })
     }
 }
 
@@ -268,6 +279,7 @@ fn reap(live: &mut Vec<Arc<Mutex<LiveSession>>>) -> Vec<Arc<Mutex<LiveSession>>>
 fn find(
     live: &[Arc<Mutex<LiveSession>>],
     turn: &PreparedTurn,
+    account: Option<&Path>,
 ) -> Result<(usize, String), &'static str> {
     let mut reason = "no_session";
     let mut depth = 0;
@@ -278,7 +290,9 @@ fn find(
             }
             continue;
         };
-        let (miss, d) = if s.native_model != turn.native_model {
+        let (miss, d) = if s.account.as_deref() != account {
+            ("account", 0)
+        } else if s.native_model != turn.native_model {
             ("model", 1)
         } else if s.system != turn.system {
             ("system", 2)
@@ -310,19 +324,19 @@ type Taken = Option<(Arc<Mutex<LiveSession>>, String)>;
 /// a keepalive, wait for it to come back — up to `KEEPALIVE_WAIT` —
 /// rather than miss and re-bill the whole transcript on a fresh child.
 /// On a miss the second item is the reason.
-fn take(turn: &PreparedTurn) -> (Taken, &'static str) {
+fn take(turn: &PreparedTurn, account: Option<&Path>) -> (Taken, &'static str) {
     let deadline = Instant::now() + KEEPALIVE_WAIT;
     let mut dead = Vec::new();
     let result = {
         let mut pool = locked_pool();
         loop {
             dead.extend(reap(&mut pool.live));
-            let reason = match find(&pool.live, turn) {
+            let reason = match find(&pool.live, turn, account) {
                 Ok((i, delta)) => break (Some((pool.live.remove(i), delta)), "reuse"),
                 Err(reason) => reason,
             };
             let left = deadline.saturating_duration_since(Instant::now());
-            if !pool.warming_for(turn) {
+            if !pool.warming_for(turn, account) {
                 break (None, reason);
             }
             if left.is_zero() {
@@ -402,6 +416,7 @@ enum Keepalive {
 fn keepalive_state(
     last_contact: Option<Instant>,
     last_used: Instant,
+    cache_live: bool,
     disabled: bool,
     dead: bool,
     alive: bool,
@@ -409,11 +424,12 @@ fn keepalive_state(
     if !alive || dead {
         return Keepalive::Gone;
     }
-    if disabled {
+    if disabled || !cache_live {
         return Keepalive::Latched;
     }
     match last_contact {
         None => Keepalive::Unsettled,
+        Some(t) if t.elapsed() >= KEEPALIVE_TOO_LATE => Keepalive::Idle,
         Some(t) if t.elapsed() <= KEEPALIVE_AFTER => Keepalive::Fresh,
         Some(_) if last_used.elapsed() > KEEPALIVE_IDLE_MAX => Keepalive::Idle,
         Some(_) => Keepalive::Due,
@@ -436,6 +452,7 @@ fn take_keepalive() -> Option<Arc<Mutex<LiveSession>>> {
                     match keepalive_state(
                         s.pingable.then_some(s.last_contact).flatten(),
                         s.last_used,
+                        s.cache_live,
                         s.keepalive_disabled,
                         s.dead,
                         matches!(s.child.try_wait(), Ok(None)),
@@ -451,27 +468,29 @@ fn take_keepalive() -> Option<Arc<Mutex<LiveSession>>> {
                     s.last_used,
                     s.native_model.clone(),
                     s.system.clone(),
+                    s.account.clone(),
                 )
             })
         })
         .collect();
     let i = snaps.iter().position(|snap| {
         snap.as_ref()
-            .is_some_and(|(due, _, last_used, model, system)| {
-                *due && !snaps.iter().flatten().any(|(_, dead2, lu, m, sys)| {
-                    !dead2 && m == model && sys == system && lu > last_used
+            .is_some_and(|(due, _, last_used, model, system, acct)| {
+                *due && !snaps.iter().flatten().any(|(_, dead2, lu, m, sys, a)| {
+                    !dead2 && m == model && sys == system && a == acct && lu > last_used
                 })
             })
     })?;
     let arc = pool.live.remove(i);
-    let (native_model, system) = {
+    let (native_model, system, account) = {
         let s = lock(&arc);
-        (s.native_model.clone(), s.system.clone())
+        (s.native_model.clone(), s.system.clone(), s.account.clone())
     };
     pool.warming.push(Warming {
         arc: Arc::clone(&arc),
         native_model,
         system,
+        account,
     });
     Some(arc)
 }
@@ -496,6 +515,7 @@ fn keepalive_sweep() {
                     None,
                     Some(&e),
                 );
+                crate::accounts::note_failure_home(s.account.as_deref(), &e);
                 if s.settled_alive() {
                     // Fail closed: never loop-refresh an erroring session;
                     // the next real turn re-arms it.
@@ -548,7 +568,11 @@ pub fn shutdown_all() {
 /// this child answers every turn of the conversation. `resume` reopens
 /// `agy`'s persisted conversation (`--conversation <sid>`) instead of
 /// starting a fresh one — [`rewarm`] passes it, turns never do.
-fn spawn(turn: &PreparedTurn, resume: Option<&str>) -> Result<Arc<Mutex<LiveSession>>, String> {
+fn spawn(
+    turn: &PreparedTurn,
+    resume: Option<&str>,
+    account: Option<&Path>,
+) -> Result<Arc<Mutex<LiveSession>>, String> {
     if let Some(key) = setup::conflicting_env() {
         return Err(format!(
             "subscription provider refuses conflicting {key}: unset it so native uses your Antigravity login"
@@ -557,7 +581,7 @@ fn spawn(turn: &PreparedTurn, resume: Option<&str>) -> Result<Arc<Mutex<LiveSess
     let binary = setup::resolve_command().ok_or_else(|| setup::INSTALL_HINT.to_string())?;
     let schema_str =
         serde_json::to_string(&turn.schema).map_err(|e| format!("schema encode: {e}"))?;
-    let isolation = TurnIsolation::stage()?;
+    let isolation = TurnIsolation::stage(account)?;
     let mut args: Vec<&str> = vec![
         "--model",
         turn.native_model.as_str(),
@@ -620,10 +644,12 @@ fn spawn(turn: &PreparedTurn, resume: Option<&str>) -> Result<Arc<Mutex<LiveSess
         last_used: Instant::now(),
         last_contact: None,
         keepalive_turns: 0,
+        cache_live: true,
         pingable: false,
         keepalive_disabled: false,
         dead: false,
         rewarmed: false,
+        account: account.map(Path::to_path_buf),
         _isolation: isolation,
     })))
 }
@@ -646,7 +672,8 @@ fn spawn_idle(rec: &session::Record) -> Option<Arc<Mutex<LiveSession>>> {
         names: Vec::new(),
         native_model: rec.model.clone(),
     };
-    let arc = spawn(&turn, Some(&rec.sid)).ok()?;
+    let account = (!rec.home.is_empty()).then(|| Path::new(&rec.home));
+    let arc = spawn(&turn, Some(&rec.sid), account).ok()?;
     let mut s = lock(&arc);
     // A mounted child announces `init` then idles on stdin; a refused
     // resume or a dead spawn surfaces as an early line/EOF — nothing
@@ -845,6 +872,7 @@ impl LiveSession {
         self.last_used = now;
         self.last_contact = Some(now);
         self.keepalive_disabled = false;
+        self.cache_live = true;
     }
 
     /// Record a failed turn whose prompt still settled upstream: the
@@ -861,6 +889,7 @@ impl LiveSession {
         self.last_used = now;
         self.last_contact = Some(now);
         self.keepalive_disabled = false;
+        self.cache_live = true;
         self.pingable = false;
     }
 
@@ -869,9 +898,12 @@ impl LiveSession {
     /// the fail-closed latch stay as the last real turn left them — the
     /// ping lives only in the child's transcript, so `take`'s match
     /// keys are untouched.
-    fn absorb_keepalive(&mut self) {
+    fn absorb_keepalive(&mut self, cached_tokens: usize) {
         self.keepalive_turns += 1;
         self.last_contact = Some(Instant::now());
+        if cached_tokens == 0 {
+            self.cache_live = false;
+        }
     }
 
     /// One cache-refresh line while this session is out of the pool:
@@ -879,6 +911,12 @@ impl LiveSession {
     /// never folded, never counted as host usage). Bounded by
     /// `KEEPALIVE_TIMEOUT`.
     fn keepalive(&mut self) -> Ping {
+        if self
+            .last_contact
+            .is_none_or(|at| at.elapsed() >= KEEPALIVE_TOO_LATE)
+        {
+            return Ping::Ok;
+        }
         let deadline = Instant::now() + KEEPALIVE_TIMEOUT;
         if let Err(e) = self.send_content(KEEPALIVE_TEXT) {
             return Ping::Wire(e);
@@ -902,17 +940,15 @@ impl LiveSession {
                     })
                     .unwrap_or("");
                 if status == "SUCCESS" {
-                    self.absorb_keepalive();
+                    let usage = chat::turn_usage(&lines);
+                    self.absorb_keepalive(usage.cached_tokens);
+                    self.cache_live = usage.input_tokens > 0
+                        && usage.cached_tokens >= usage.input_tokens.div_ceil(2);
                     trace_turn(
                         &format!("keepalive:{}", self.keepalive_turns),
                         self,
                         KEEPALIVE_TEXT.len(),
-                        lines
-                            .iter()
-                            .rev()
-                            .find_map(|v| v.pointer("/result/usage").or_else(|| v.get("usage")))
-                            .map(chat::map_usage)
-                            .as_ref(),
+                        Some(&usage),
                         None,
                     );
                     Ping::Ok
@@ -981,12 +1017,36 @@ pub fn run_turn(
     model: &str,
     effort: Option<&str>,
     timeout: Duration,
+    isolated: bool,
+    account: Option<&crate::accounts::Pick>,
+) -> Result<Vec<u8>, String> {
+    let home = account.and_then(|p| p.home.as_deref());
+    let out = run_turn_on(body, model, effort, timeout, isolated, home);
+    if let Some(p) = account {
+        match &out {
+            Ok(_) => crate::accounts::note_success(&p.label),
+            Err(e) => crate::accounts::note_failure(&p.label, e),
+        }
+    }
+    out
+}
+
+fn run_turn_on(
+    body: &Value,
+    model: &str,
+    effort: Option<&str>,
+    timeout: Duration,
+    isolated: bool,
+    account: Option<&Path>,
 ) -> Result<Vec<u8>, String> {
     let deadline = Instant::now() + timeout;
     let mut turn = chat::prepare_turn(body, model)?;
     turn.native_model = crate::catalog::native_model_for_effort(model, effort);
     let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
-    let (claimed, mut reason) = take(&turn);
+    if isolated {
+        return run_isolated(&turn, &say, deadline, account);
+    }
+    let (claimed, mut reason) = take(&turn, account);
     if let Some((arc, delta)) = claimed {
         let chars = delta.chars().count();
         let mut s = lock(&arc);
@@ -1023,7 +1083,7 @@ pub fn run_turn(
     let mode = format!("fresh:{reason}");
     let content = chat::fit_prompt(&turn.system, &turn.content_line);
     let chars = content.chars().count();
-    let arc = match spawn(&turn, None) {
+    let arc = match spawn(&turn, None, account) {
         Ok(arc) => arc,
         Err(e) => {
             trace(&mode, "-", chars, None, Some(&e));
@@ -1048,6 +1108,32 @@ pub fn run_turn(
     out
 }
 
+fn run_isolated(
+    turn: &PreparedTurn,
+    say: &Arc<dyn Fn(String) + Send + Sync>,
+    deadline: Instant,
+    account: Option<&Path>,
+) -> Result<Vec<u8>, String> {
+    let content = chat::fit_prompt(&turn.system, &turn.content_line);
+    let chars = content.chars().count();
+    let arc = spawn(turn, None, account)
+        .inspect_err(|e| trace("isolated", "-", chars, None, Some(e.as_str())))?;
+    let mut s = lock(&arc);
+    let out = match s.send_content(&content) {
+        Ok(()) => s
+            .drain(deadline)
+            .and_then(|lines| chat::fold_lines(&lines, &turn.names, say).map(|f| f.0)),
+        Err(e) => Err(e),
+    };
+    trace_result("isolated", &s, chars, &out);
+    s.close();
+    out
+}
+
+fn keepalive_helps(native_model: &str) -> bool {
+    !native_model.contains("neon")
+}
+
 /// Drain a turn to its `result` line and fold it. On success the session
 /// absorbs input + reply; on a settled-but-failed result it absorbs the
 /// input with no reply and pools only if the child survived; on dead
@@ -1069,7 +1155,9 @@ fn settle(
     match chat::fold_lines(&lines, &turn.names, say) {
         Ok((sse, _, text, calls, usage, _)) => {
             s.absorb(turn, &text, &calls);
-            s.pingable = !turn.names.is_empty() && usage.input_tokens >= KEEPALIVE_MIN_TOKENS;
+            s.pingable = !turn.names.is_empty()
+                && usage.input_tokens >= KEEPALIVE_MIN_TOKENS
+                && keepalive_helps(&turn.native_model);
             record(s);
             Ok(sse)
         }
@@ -1080,6 +1168,7 @@ fn settle(
                 // this warm child (well, misses and respawns — but a
                 // LATER distinct turn continues with only its tail).
                 s.absorb_failed(turn);
+                s.pingable = false;
                 record(s);
             } else {
                 s.close();
@@ -1105,6 +1194,11 @@ fn record(s: &LiveSession) {
         absorbed: s.absorbed.clone(),
         reply_call_ids: s.reply_call_ids.clone(),
         reply_text: s.reply_text.clone(),
+        home: s
+            .account
+            .as_deref()
+            .map(|h| h.display().to_string())
+            .unwrap_or_default(),
         saved_at: SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()

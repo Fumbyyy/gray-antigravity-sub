@@ -27,7 +27,7 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn iso(secs: u64) -> String {
+pub(crate) fn iso(secs: u64) -> String {
     let days = (secs / 86400) as i64;
     let tod = secs % 86400;
     let (y, m, d) = civil(days);
@@ -150,7 +150,8 @@ fn read_event() -> Option<Value> {
 /// `provider/usage` entry: quota-event → honest card. Nothing is fetched
 /// from the network, and the plugin holds no agy credential.
 pub fn handle() -> Result<Value, ProviderRpcError> {
-    if let Some(windows) = live_windows() {
+    let home = crate::accounts::probe_home();
+    if let Some(windows) = live_windows(home.as_deref()) {
         return Ok(json!({
             "available": true,
             "title": "Antigravity",
@@ -180,9 +181,27 @@ pub fn handle() -> Result<Value, ProviderRpcError> {
 
 const LIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn live_windows() -> Option<Vec<Value>> {
-    let out = crate::discover::capture(&["-p", "/usage", "--output-format", "json"], LIVE_TIMEOUT)?;
+fn live_windows(home: Option<&Path>) -> Option<Vec<Value>> {
+    let out = crate::discover::capture_in(
+        &["-p", "/usage", "--output-format", "json"],
+        LIVE_TIMEOUT,
+        home,
+    )?;
     parse_live(&serde_json::from_str(&out).ok()?)
+}
+
+pub fn account_card(home: Option<&Path>) -> Result<Value, String> {
+    let Some(home) = home else {
+        return handle().map_err(|e| e.to_string());
+    };
+    let windows = live_windows(Some(home))
+        .ok_or_else(|| format!("`agy -p /usage` read no quota from {}", home.display()))?;
+    Ok(json!({
+        "available": true,
+        "title": "Antigravity",
+        "windows": windows,
+        "checked_at": iso(now_secs()),
+    }))
 }
 
 pub fn parse_live(doc: &Value) -> Option<Vec<Value>> {

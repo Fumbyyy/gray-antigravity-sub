@@ -35,6 +35,7 @@ const KEEPALIVE: Duration = Duration::from_secs(15);
 /// What `provider/chat` parked for one turn: the relay fills the body in.
 pub struct RelayIntent {
     pub model: String,
+    pub account: Option<crate::accounts::Pick>,
 }
 
 pub type Intents = Arc<Mutex<HashMap<String, RelayIntent>>>;
@@ -93,6 +94,7 @@ fn handle_conn(
     let request_line = lines.next().unwrap_or("").to_string();
     let mut len = 0usize;
     let mut auth = String::new();
+    let mut isolated = false;
     for line in lines {
         let line = line.trim_end();
         if line.is_empty() {
@@ -105,6 +107,8 @@ fn handle_conn(
             len = v.trim().parse().unwrap_or(0);
         } else if name.eq_ignore_ascii_case("authorization") {
             auth = v.trim().to_string();
+        } else if name.eq_ignore_ascii_case("x-gray-isolated") {
+            isolated = v.trim() == "1";
         }
     }
     let header_end = head
@@ -157,7 +161,7 @@ fn handle_conn(
         let intents = intents.clone();
         let bearer = bearer.to_string();
         std::thread::spawn(move || {
-            let _ = tx.send(run_turn(&intents, &bearer, &body));
+            let _ = tx.send(run_turn(&intents, &bearer, &body, isolated));
         });
     }
     match rx.recv_timeout(HEADER_GRACE) {
@@ -215,7 +219,12 @@ fn handle_conn(
     }
 }
 
-fn run_turn(intents: &Intents, bearer: &str, raw: &[u8]) -> Result<Vec<u8>, String> {
+fn run_turn(
+    intents: &Intents,
+    bearer: &str,
+    raw: &[u8],
+    isolated: bool,
+) -> Result<Vec<u8>, String> {
     let intent = intents
         .lock()
         .map(|mut m| m.remove(bearer))
@@ -238,6 +247,8 @@ fn run_turn(intents: &Intents, bearer: &str, raw: &[u8]) -> Result<Vec<u8>, Stri
         &intent.model,
         effort,
         std::time::Duration::from_secs(300),
+        isolated,
+        intent.account.as_ref(),
     )
 }
 
