@@ -1143,6 +1143,9 @@ pub fn fold_lines(
     if answer.is_empty() && !has_calls {
         return Err("incomplete native response: finish carried no answer".into());
     }
+    if !has_calls && malformed_finish_answer(&answer) {
+        return Err("incomplete native response: finish carried malformed call syntax".into());
+    }
     say(format!("…{answer}"));
     let mut calls: Vec<(String, String, String)> = Vec::new();
     // Unique per fold, not per-turn deterministic: pooled sessions answer
@@ -1238,6 +1241,21 @@ pub fn fold_lines(
     );
     sse.extend_from_slice(b"data: [DONE]\n\n");
     Ok((sse, natives, answer, calls, usage, stop))
+}
+
+fn malformed_finish_answer(answer: &str) -> bool {
+    let trimmed = answer.trim_start();
+    [
+        ",calls:",
+        ",\"calls\":",
+        "calls:[{",
+        ",args:",
+        ",\"args\":",
+        "call:default_api:finish{",
+        "default_api:finish{",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix))
 }
 
 fn garbled_name(raw: &str, names: &[String]) -> Option<String> {
