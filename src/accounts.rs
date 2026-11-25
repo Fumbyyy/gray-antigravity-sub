@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -12,6 +13,13 @@ const COOL_429: u64 = 60 * 60;
 const SOLE_CAP: u64 = 60;
 const MAX_RESET: u64 = 8 * 24 * 3600;
 const USAGE_DEADLINE: Duration = Duration::from_secs(20);
+const GROUPS: [&str; 3] = ["Gemini", "Claude/GPT", "Argon"];
+
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
+pub struct Cooldown {
+    pub until: u64,
+    pub reason: String,
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct Account {
@@ -25,6 +33,8 @@ pub struct Account {
     pub added_at: u64,
     #[serde(default)]
     pub health: Health,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cooldowns: BTreeMap<String, Cooldown>,
     #[serde(default)]
     pub request_count: u64,
     #[serde(default)]
@@ -129,46 +139,176 @@ fn load() -> Store {
     load_checked().unwrap_or_default()
 }
 
+fn spawn_home(home: &Path) -> Option<&Path> {
+    (!home.as_os_str().is_empty()).then_some(home)
+}
+
+fn ensure_default(store: &mut Store) {
+    if store
+        .accounts
+        .iter()
+        .any(|a| a.home.as_os_str().is_empty() || a.label == "default")
+    {
+        return;
+    }
+    let has_ambient = crate::agy::credential_file().is_some()
+        || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty())
+        || cfg!(target_os = "macos");
+    if !has_ambient {
+        return;
+    }
+    let email = std::env::var_os("HOME").and_then(|h| identity_of(Path::new(&h)));
+    if let Some(e) = &email
+        && store
+            .accounts
+            .iter()
+            .any(|a| a.email.as_deref() == Some(e.as_str()))
+    {
+        return;
+    }
+    store.accounts.insert(
+        0,
+        Account {
+            label: "default".to_string(),
+            home: PathBuf::new(),
+            email,
+            org: None,
+            added_at: 0,
+            health: Health::Ready,
+            cooldowns: BTreeMap::new(),
+            request_count: 0,
+            last_used_at: 0,
+        },
+    );
+}
+
+fn single_group(m: &str) -> &'static str {
+    if m.contains("claude") || m.contains("gpt") || m == "opus" || m == "sonnet" {
+        "Claude/GPT"
+    } else if m.contains("argon") || m.contains("g1-pro") {
+        "Argon"
+    } else {
+        "Gemini"
+    }
+}
+
+pub fn model_groups(model: &str) -> Vec<&'static str> {
+    let m = model.trim().to_ascii_lowercase();
+    let m = m.rsplit_once('/').map_or(m.as_str(), |(_, id)| id);
+    if m.is_empty() {
+        return Vec::new();
+    }
+    if let Some(rest) = m.strip_prefix("gemini-pro-orchestrator--") {
+        let mut parts = rest.split("--");
+        let mut out = Vec::new();
+        if let Some(p) = parts.next().filter(|s| !s.is_empty()) {
+            out.push(single_group(p));
+        }
+        if let Some(e) = parts.next().filter(|s| !s.is_empty()) {
+            let g = single_group(e);
+            if !out.contains(&g) {
+                out.push(g);
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    vec![single_group(m)]
+}
+
+fn adopt_legacy(store: &mut Store) {
+    let now = now_secs();
+    for a in &mut store.accounts {
+        if let Health::Cooling { until, reason } = &a.health {
+            if *until > now {
+                let g = single_group(&reason.to_ascii_lowercase());
+                a.cooldowns
+                    .entry(g.to_string())
+                    .or_insert_with(|| Cooldown {
+                        until: *until,
+                        reason: reason.clone(),
+                    });
+            }
+            a.health = Health::Ready;
+        }
+        a.cooldowns.retain(|_, c| c.until > now);
+    }
+}
+
 fn load_checked() -> Result<Store, String> {
     let Some(path) = file_path() else {
-        return Ok(Store::default());
+        let mut s = Store::default();
+        ensure_default(&mut s);
+        return Ok(s);
     };
-    match std::fs::read_to_string(&path) {
-        Ok(text) if text.trim().is_empty() => Ok(Store::default()),
-        Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Store::default()),
-        Err(e) => Err(format!("{}: {e}", path.display())),
-    }
+    let mut store: Store = match std::fs::read_to_string(&path) {
+        Ok(text) if text.trim().is_empty() => Store::default(),
+        Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Store::default(),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    adopt_legacy(&mut store);
+    ensure_default(&mut store);
+    Ok(store)
 }
 
 fn mutate<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, String> {
     let path = file_path().ok_or("cannot resolve GRAY_HOME")?;
     let _lock =
-        crate::session::lock_file(&path).map_err(|e| format!("lock {}: {e}", path.display()))?;
-    let mut store = match std::fs::read_to_string(&path) {
+        crate::store::lock_file(&path).map_err(|e| format!("lock {}: {e}", path.display()))?;
+    let mut store: Store = match std::fs::read_to_string(&path) {
         Ok(text) if text.trim().is_empty() => Store::default(),
         Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Store::default(),
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
     let before = serde_json::to_string(&store).map_err(|e| e.to_string())?;
+    adopt_legacy(&mut store);
+    ensure_default(&mut store);
     let out = f(&mut store)?;
     if serde_json::to_string(&store).map_err(|e| e.to_string())? != before {
         let text = serde_json::to_string_pretty(&store).map_err(|e| e.to_string())?;
-        crate::session::write_atomic(&path, text.as_bytes())
+        crate::store::write_atomic(&path, text.as_bytes())
             .map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(out)
 }
 
-fn current(a: &Account, now: u64) -> Health {
+fn current_auth(a: &Account, now: u64) -> Health {
     match &a.health {
-        Health::Cooling { until, .. } | Health::AuthFailed { until, .. } if *until > now => {
-            a.health.clone()
-        }
+        Health::AuthFailed { until, .. } if *until > now => a.health.clone(),
         Health::SignedOut { .. } => a.health.clone(),
         _ => Health::Ready,
     }
+}
+
+fn group_cooldown<'a>(a: &'a Account, group: &str, now: u64) -> Option<&'a Cooldown> {
+    a.cooldowns.get(group).filter(|c| c.until > now)
+}
+
+fn active_cooldowns(a: &Account, now: u64) -> Vec<(&'static str, &Cooldown)> {
+    GROUPS
+        .iter()
+        .filter_map(|g| group_cooldown(a, g, now).map(|c| (*g, c)))
+        .collect()
+}
+
+fn current(a: &Account, now: u64) -> Health {
+    let auth = current_auth(a, now);
+    if !matches!(auth, Health::Ready) {
+        return auth;
+    }
+    let active = active_cooldowns(a, now);
+    if active.len() == GROUPS.len()
+        && let Some((_, c)) = active.into_iter().min_by_key(|(_, c)| c.until)
+    {
+        return Health::Cooling {
+            until: c.until,
+            reason: c.reason.clone(),
+        };
+    }
+    Health::Ready
 }
 
 fn until_of(h: &Health) -> u64 {
@@ -186,45 +326,54 @@ fn reason_of(h: &Health) -> Option<String> {
     }
 }
 
-fn usable(a: &Account, now: u64) -> bool {
-    matches!(current(a, now), Health::Ready)
+fn last_error_of(a: &Account, now: u64) -> Option<String> {
+    if let Some(msg) = reason_of(&current_auth(a, now)) {
+        return Some(msg);
+    }
+    active_cooldowns(a, now)
+        .into_iter()
+        .min_by_key(|(_, c)| c.until)
+        .map(|(g, c)| format!("[{g}] {}", c.reason))
 }
 
-fn transition(
-    h: &Health,
-    verdict: &crate::chat::Verdict,
-    detail: &str,
-    now: u64,
-    lone: bool,
-) -> Health {
-    let (ttl, auth) = match verdict {
-        crate::chat::Verdict::Unauthorized => (COOL_401, true),
-        crate::chat::Verdict::RateLimited { retry_after } => (
-            match retry_after {
-                Some(d) => d.as_secs().min(MAX_RESET),
-                None => COOL_429,
-            },
-            false,
-        ),
-    };
-    let cap = if lone { SOLE_CAP } else { MAX_RESET };
-    let until = until_of(h).max(now + ttl.min(cap).max(1));
-    let msg: String = detail.chars().take(200).collect();
-    if auth {
-        Health::AuthFailed { until, msg }
+fn usable_for(a: &Account, groups: &[&str], now: u64) -> bool {
+    if !matches!(current_auth(a, now), Health::Ready) {
+        return false;
+    }
+    if groups.is_empty() {
+        GROUPS.iter().any(|g| group_cooldown(a, g, now).is_none())
     } else {
-        Health::Cooling { until, reason: msg }
+        groups.iter().all(|g| group_cooldown(a, g, now).is_none())
+    }
+}
+
+fn until_for(a: &Account, groups: &[&str], now: u64) -> u64 {
+    if let Health::AuthFailed { until, .. } = current_auth(a, now) {
+        return until;
+    }
+    if groups.is_empty() {
+        GROUPS
+            .iter()
+            .filter_map(|g| group_cooldown(a, g, now).map(|c| c.until))
+            .min()
+            .unwrap_or(0)
+    } else {
+        groups
+            .iter()
+            .filter_map(|g| group_cooldown(a, g, now).map(|c| c.until))
+            .max()
+            .unwrap_or(0)
     }
 }
 
 fn pick_of(a: &Account) -> Pick {
     Pick {
         label: a.label.clone(),
-        home: Some(a.home.clone()),
+        home: spawn_home(&a.home).map(Path::to_path_buf),
     }
 }
 
-fn serve(store: &Store) -> Serving {
+fn serve_for(store: &Store, groups: &[&str]) -> Serving {
     if store.accounts.is_empty() {
         return Serving::Ambient;
     }
@@ -233,7 +382,7 @@ fn serve(store: &Store) -> Serving {
         && let Some(a) = store
             .accounts
             .iter()
-            .find(|a| a.label == sel && usable(a, now))
+            .find(|a| a.label == sel && usable_for(a, groups, now))
     {
         return Serving::Account(pick_of(a));
     }
@@ -241,9 +390,9 @@ fn serve(store: &Store) -> Serving {
         Strategy::LeastUsed => store
             .accounts
             .iter()
-            .filter(|a| usable(a, now))
+            .filter(|a| usable_for(a, groups, now))
             .min_by_key(|a| a.last_used_at),
-        Strategy::FillFirst => store.accounts.iter().find(|a| usable(a, now)),
+        Strategy::FillFirst => store.accounts.iter().find(|a| usable_for(a, groups, now)),
     };
     if let Some(a) = next {
         return Serving::Account(pick_of(a));
@@ -252,7 +401,7 @@ fn serve(store: &Store) -> Serving {
         .accounts
         .iter()
         .filter(|a| !matches!(a.health, Health::SignedOut { .. }))
-        .min_by_key(|a| until_of(&current(a, now)))
+        .min_by_key(|a| until_for(a, groups, now))
     else {
         return Serving::AllCooling {
             until: 0,
@@ -262,17 +411,26 @@ fn serve(store: &Store) -> Serving {
             ),
         };
     };
-    let until = until_of(&current(soon, now));
+    let until = until_for(soon, groups, now);
     let mins = until.saturating_sub(now).div_ceil(60).max(1);
+    let scope = if groups.is_empty() {
+        String::new()
+    } else {
+        format!(" for {}", groups.join(" + "))
+    };
     Serving::AllCooling {
         until,
         reason: format!(
-            "all {} antigravity accounts are cooling down; {} next at {} (in ~{mins}m)",
+            "all {} antigravity accounts are cooling down{scope}; {} next at {} \u{b7} resets in ~{mins}m",
             store.accounts.len(),
             soon.label,
             usage::iso(until),
         ),
     }
+}
+
+fn serve(store: &Store) -> Serving {
+    serve_for(store, &[])
 }
 
 pub fn serving() -> Serving {
@@ -310,17 +468,22 @@ fn verify(p: &Pick) -> Result<(), String> {
 }
 
 pub fn pick() -> Result<Option<Pick>, String> {
+    pick_for("")
+}
+
+pub fn pick_for(model: &str) -> Result<Option<Pick>, String> {
+    let groups = model_groups(model);
     let n = load_checked()?.accounts.len();
     if n == 0 {
         return Ok(None);
     }
     for _ in 0..=n {
-        match serving() {
+        match serve_for(&load(), &groups) {
             Serving::Account(p) if verify(&p).is_err() => {}
             _ => break,
         }
     }
-    mutate(|store| match serve(store) {
+    mutate(|store| match serve_for(store, &groups) {
         Serving::Account(p) => {
             if let Some(a) = store.accounts.iter_mut().find(|a| a.label == p.label) {
                 a.request_count += 1;
@@ -329,35 +492,159 @@ pub fn pick() -> Result<Option<Pick>, String> {
             Ok(Some(p))
         }
         Serving::Ambient => Ok(None),
-        Serving::AllCooling { reason, .. } => Err(reason),
+        Serving::AllCooling { reason, .. } => {
+            if groups.is_empty() {
+                let now = now_secs();
+                if let Some(a) = store
+                    .accounts
+                    .iter()
+                    .find(|a| matches!(current_auth(a, now), Health::Ready))
+                {
+                    return Ok(Some(pick_of(a)));
+                }
+            }
+            Err(reason)
+        }
     })
 }
 
 pub fn note_success(label: &str) {
-    let store = load();
-    let Some(a) = store.accounts.iter().find(|a| a.label == label) else {
-        return;
-    };
-    if a.health == Health::Ready {
-        return;
-    }
+    note_success_for(label, "");
+}
+
+pub fn note_success_for(label: &str, model: &str) {
+    let groups = model_groups(model);
     let _ = mutate(|store| {
         if let Some(a) = store.accounts.iter_mut().find(|a| a.label == label) {
-            a.health = Health::Ready;
+            if !matches!(a.health, Health::Ready) {
+                a.health = Health::Ready;
+            }
+            for g in &groups {
+                a.cooldowns.remove(*g);
+            }
         }
         Ok(())
     });
 }
 
 pub fn note_failure(label: &str, detail: &str) {
-    let Some(verdict) = crate::chat::verdict_of(detail) else {
+    note_failure_for(label, "", detail);
+}
+
+pub fn note_failure_for(label: &str, model: &str, detail: &str) {
+    let Some(verdict) = crate::agy::verdict_of(detail) else {
         return;
     };
+    let groups = model_groups(model);
+    let group = groups.first().copied().unwrap_or("Gemini");
     let _ = mutate(|store| {
         let now = now_secs();
         let lone = store.accounts.len() == 1;
+        let cap = if lone { SOLE_CAP } else { MAX_RESET };
+        let msg: String = detail.chars().take(200).collect();
         if let Some(a) = store.accounts.iter_mut().find(|a| a.label == label) {
-            a.health = transition(&current(a, now), &verdict, detail, now, lone);
+            match verdict {
+                crate::agy::Verdict::Unauthorized => {
+                    let cur = until_of(&current_auth(a, now));
+                    let until = cur.max(now + COOL_401.min(cap).max(1));
+                    a.health = Health::AuthFailed { until, msg };
+                }
+                crate::agy::Verdict::RateLimited { retry_after } => {
+                    let ttl = match retry_after {
+                        Some(d) => d.as_secs().min(MAX_RESET),
+                        None => COOL_429,
+                    };
+                    let cur = group_cooldown(a, group, now).map_or(0, |c| c.until);
+                    let until = cur.max(now + ttl.min(cap).max(1));
+                    a.cooldowns
+                        .insert(group.to_string(), Cooldown { until, reason: msg });
+                }
+            }
+        }
+        Ok(())
+    });
+}
+
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(146097);
+    let yoe = y - era * 400;
+    let doy = (153 * if m > 2 { m - 3 } else { m + 9 } + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy as i64;
+    era * 146097 + doe - 719468
+}
+
+fn parse_iso_secs(s: &str) -> Option<u64> {
+    let (date, time) = s.trim().split_once('T')?;
+    let mut d = date.split('-');
+    let y: i64 = d.next()?.parse().ok()?;
+    let mo: u32 = d.next()?.parse().ok()?;
+    let da: u32 = d.next()?.parse().ok()?;
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&da) {
+        return None;
+    }
+    let time = time.strip_suffix('Z').unwrap_or(time);
+    let mut t = time.split(':');
+    let h: i64 = t.next()?.parse().ok()?;
+    let mi: i64 = t.next()?.parse().ok()?;
+    let se: i64 = t.next().unwrap_or("0").split('.').next()?.parse().ok()?;
+    let secs = days_from_civil(y, mo, da) * 86400 + h * 3600 + mi * 60 + se;
+    (secs > 0).then_some(secs as u64)
+}
+
+pub fn sync_usage_windows(home: Option<&Path>, windows: &[Value]) {
+    let want = home.filter(|h| !h.as_os_str().is_empty());
+    let _ = mutate(|store| {
+        let now = now_secs();
+        let Some(a) = store
+            .accounts
+            .iter_mut()
+            .find(|a| spawn_home(&a.home) == want)
+        else {
+            return Ok(());
+        };
+        for g in GROUPS {
+            let mut max_pct: Option<f64> = None;
+            let mut exhausted_until: Option<u64> = None;
+            for w in windows {
+                let Some((_, grp)) = w
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .and_then(|l| l.split_once(" \u{b7} "))
+                else {
+                    continue;
+                };
+                if grp != g {
+                    continue;
+                }
+                let Some(pct) = w.get("used_percent").and_then(Value::as_f64) else {
+                    continue;
+                };
+                max_pct = Some(max_pct.map_or(pct, |cur| cur.max(pct)));
+                if pct >= 100.0
+                    && let Some(r) = w
+                        .get("resets_at")
+                        .and_then(Value::as_str)
+                        .and_then(parse_iso_secs)
+                        .filter(|r| *r > now)
+                {
+                    exhausted_until = Some(exhausted_until.map_or(r, |cur| cur.max(r)));
+                }
+            }
+            if let Some(until) = exhausted_until {
+                let entry = a
+                    .cooldowns
+                    .entry(g.to_string())
+                    .or_insert_with(|| Cooldown {
+                        until,
+                        reason: format!("Antigravity {g} quota exhausted"),
+                    });
+                if until > entry.until {
+                    entry.until = until;
+                }
+            } else if max_pct.is_some_and(|p| p < 90.0) {
+                a.cooldowns.remove(g);
+            }
         }
         Ok(())
     });
@@ -402,6 +689,7 @@ pub fn command(args: &[String], interactive: bool) -> Result<String, String> {
         Some("add") => cmd_add(&args[1..], interactive, json),
         Some("use") => cmd_use(&args[1..], json),
         Some("remove") | Some("rm") => cmd_remove(&args[1..], json),
+        Some("reset") => cmd_reset(&args[1..], json),
         Some("strategy") => cmd_strategy(&args[1..], json),
         Some("status") => cmd_status(json),
         Some("usage") => cmd_usage(&args[1..], json),
@@ -411,6 +699,37 @@ pub fn command(args: &[String], interactive: bool) -> Result<String, String> {
     }
 }
 
+fn cmd_reset(args: &[String], json: bool) -> Result<String, String> {
+    let all = args.iter().any(|a| a == "--all") || args.is_empty();
+    let want = args.iter().find(|a| !a.starts_with("--")).cloned();
+    let cleared = mutate(|store| {
+        let mut cleared = Vec::new();
+        for a in &mut store.accounts {
+            if !all && want.as_deref() != Some(a.label.as_str()) {
+                continue;
+            }
+            let had_cool = !a.cooldowns.is_empty()
+                || matches!(a.health, Health::Cooling { .. } | Health::AuthFailed { .. });
+            if had_cool {
+                a.cooldowns.clear();
+                if !matches!(a.health, Health::SignedOut { .. }) {
+                    a.health = Health::Ready;
+                }
+                cleared.push(a.label.clone());
+            }
+        }
+        Ok(cleared)
+    })?;
+    if json {
+        return ok_json(json!({"cleared": cleared}));
+    }
+    Ok(if cleared.is_empty() {
+        "no cached cooldowns to clear".to_string()
+    } else {
+        format!("cleared {}", cleared.join(", "))
+    })
+}
+
 fn store_json(store: &Store) -> Result<String, String> {
     let now = now_secs();
     let accounts: Vec<Value> = store
@@ -418,6 +737,8 @@ fn store_json(store: &Store) -> Result<String, String> {
         .iter()
         .map(|a| {
             let health = current(a, now);
+            let cooldowns: BTreeMap<&str, &Cooldown> =
+                active_cooldowns(a, now).into_iter().collect();
             json!({
                 "label": a.label,
                 "home": a.home.display().to_string(),
@@ -426,7 +747,8 @@ fn store_json(store: &Store) -> Result<String, String> {
                 "added_at": a.added_at,
                 "cooldown_until": until_of(&health),
                 "cooling": !matches!(health, Health::Ready),
-                "last_error": reason_of(&health),
+                "cooldowns": cooldowns,
+                "last_error": last_error_of(a, now),
                 "health": health,
                 "request_count": a.request_count,
                 "last_used_at": a.last_used_at,
@@ -512,6 +834,7 @@ fn admit(label: &str, home: &Path) -> Result<Insert, String> {
             org: None,
             added_at: now_secs(),
             health: Health::Ready,
+            cooldowns: BTreeMap::new(),
             request_count: 0,
             last_used_at: 0,
         });
@@ -548,17 +871,43 @@ fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, Str
         let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o700));
     }
     eprintln!("signing {label:?} in under {} …", dest.display());
-    let placed = std::process::Command::new(&binary)
-        .args(["-p", "/usage"])
+    let real_home = std::env::var("HOME").unwrap_or_default();
+    let shim = dest.join("xdg-open");
+    if !real_home.is_empty() {
+        let script = format!(
+            "#!/bin/sh\nHOME='{}' exec /usr/bin/xdg-open \"$@\" >/dev/null 2>&1 &\n",
+            real_home.replace('\'', "'\\''")
+        );
+        if std::fs::write(&shim, script).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+    let path_env = format!(
+        "{}:{}",
+        dest.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(["-p", "/usage"])
         .envs(setup::child_env())
         .env("HOME", &dest)
+        .env("PATH", path_env)
+        .env("BROWSER", &shim)
         .envs([setup::keyring_off(&dest)])
-        .env("BROWSER", "/bin/true")
-        .env("DISPLAY", "")
-        .env("WAYLAND_DISPLAY", "")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if std::env::var_os("XAUTHORITY").is_none() && !real_home.is_empty() {
+        let xauth = Path::new(&real_home).join(".Xauthority");
+        if xauth.is_file() {
+            cmd.env("XAUTHORITY", xauth);
+        }
+    }
+    let placed = cmd
         .status()
         .map_err(|e| format!("spawn agy: {e}"))
         .and_then(|s| {
@@ -568,6 +917,7 @@ fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, Str
                 Err(format!("agy sign-in failed (exited {s})"))
             }
         });
+    let _ = std::fs::remove_file(&shim);
     if let Err(e) = placed {
         let _ = std::fs::remove_dir_all(&dest);
         return Err(e);
@@ -701,7 +1051,20 @@ fn account_line(a: &Account, now: u64, selected: &Option<String>) -> String {
         ' '
     };
     let state = match current(a, now) {
-        Health::Ready => "ok".to_string(),
+        Health::Ready => {
+            let active = active_cooldowns(a, now);
+            if active.is_empty() {
+                "ok".to_string()
+            } else {
+                let groups: Vec<&str> = active.iter().map(|(g, _)| *g).collect();
+                let until = active.iter().map(|(_, c)| c.until).min().unwrap_or(0);
+                format!(
+                    "ok ({} cooled until {})",
+                    groups.join(", "),
+                    usage::iso(until)
+                )
+            }
+        }
         Health::Cooling { until, .. } => format!("cooled until {}", usage::iso(until)),
         Health::AuthFailed { until, .. } => format!("auth failed until {}", usage::iso(until)),
         Health::SignedOut { .. } => "signed out".to_string(),
@@ -760,7 +1123,7 @@ fn cmd_status(json: bool) -> Result<String, String> {
     out.push_str(&format!("strategy: {}\n", store.strategy.name()));
     for a in &store.accounts {
         out.push_str(&account_line(a, now, &store.selected));
-        if let Some(e) = reason_of(&current(a, now)) {
+        if let Some(e) = last_error_of(a, now) {
             out.push_str(&format!("  last error: {e}"));
         }
         out.push('\n');
@@ -783,7 +1146,12 @@ fn usage_targets(store: &Store, want: Option<&str>) -> Result<Targets, String> {
         .accounts
         .iter()
         .filter(|a| want.is_none_or(|w| a.label == w))
-        .map(|a| (Some(a.label.clone()), Some(a.home.clone())))
+        .map(|a| {
+            (
+                Some(a.label.clone()),
+                spawn_home(&a.home).map(Path::to_path_buf),
+            )
+        })
         .collect();
     match want {
         Some(w) if picked.is_empty() => Err(format!("no account labelled {w:?}")),

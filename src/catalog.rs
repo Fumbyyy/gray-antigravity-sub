@@ -74,7 +74,7 @@ fn aliases() -> &'static [(&'static str, &'static str, &'static str)] {
 /// The effort tiers `agy` bakes into ids, in the catalog's preference
 /// order: `resolve_alias` degrades a family through the same sequence,
 /// and a bare base resolves to its first routable member.
-pub(crate) const TIERS: &[&str] = &["low", "medium", "high"];
+pub(crate) const TIERS: &[&str] = &["low", "medium", "high", "xhigh"];
 
 const BARE_TAIL: &[&str] = &["low", "medium", "high", "xhigh"];
 
@@ -243,6 +243,9 @@ pub(crate) fn native_model_for_effort_in(
     effort: Option<&str>,
 ) -> String {
     let bare = without_provider(model);
+    if bare.starts_with("gemini-pro-orchestrator--") {
+        return bare.to_string();
+    }
     if !BARE_TAIL.iter().any(|t| bare.ends_with(&format!("-{t}")))
         && !snap.is_routable(bare)
         && snap.resolve_alias(bare).is_none()

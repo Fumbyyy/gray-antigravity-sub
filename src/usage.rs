@@ -187,21 +187,25 @@ fn live_windows(home: Option<&Path>) -> Option<Vec<Value>> {
         LIVE_TIMEOUT,
         home,
     )?;
-    parse_live(&serde_json::from_str(&out).ok()?)
+    let windows = parse_live(&serde_json::from_str(&out).ok()?)?;
+    crate::accounts::sync_usage_windows(home, &windows);
+    Some(windows)
 }
 
 pub fn account_card(home: Option<&Path>) -> Result<Value, String> {
-    let Some(home) = home else {
+    if let Some(windows) = live_windows(home) {
+        return Ok(json!({
+            "available": true,
+            "title": "Antigravity",
+            "windows": windows,
+            "checked_at": iso(now_secs()),
+        }));
+    }
+    if home.is_none() {
         return handle().map_err(|e| e.to_string());
-    };
-    let windows = live_windows(Some(home))
-        .ok_or_else(|| format!("`agy -p /usage` read no quota from {}", home.display()))?;
-    Ok(json!({
-        "available": true,
-        "title": "Antigravity",
-        "windows": windows,
-        "checked_at": iso(now_secs()),
-    }))
+    }
+    let dir = home.map(|h| h.display().to_string()).unwrap_or_default();
+    Err(format!("`agy -p /usage` read no quota from {dir}"))
 }
 
 pub fn parse_live(doc: &Value) -> Option<Vec<Value>> {
