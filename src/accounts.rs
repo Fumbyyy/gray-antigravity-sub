@@ -153,11 +153,12 @@ fn ensure_default(store: &mut Store) {
     }
     let has_ambient = crate::agy::credential_file().is_some()
         || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty())
-        || cfg!(target_os = "macos");
+        || cfg!(target_os = "macos")
+        || cfg!(windows);
     if !has_ambient {
         return;
     }
-    let email = std::env::var_os("HOME").and_then(|h| identity_of(Path::new(&h)));
+    let email = setup::home_dir().and_then(|h| identity_of(&h));
     if let Some(e) = &email
         && store
             .accounts
@@ -871,47 +872,55 @@ fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, Str
         let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o700));
     }
     eprintln!("signing {label:?} in under {} …", dest.display());
-    let real_home = std::env::var("HOME").unwrap_or_default();
-    let shim = dest.join("xdg-open");
-    if !real_home.is_empty() {
-        let quote = |v: &str| format!("'{}'", v.replace('\'', "'\\''"));
-        let bus = match std::env::var("DBUS_SESSION_BUS_ADDRESS") {
-            Ok(v) if !v.is_empty() => format!("export DBUS_SESSION_BUS_ADDRESS={}\n", quote(&v)),
-            _ => "unset DBUS_SESSION_BUS_ADDRESS\n".to_string(),
-        };
-        let script = format!(
-            "#!/bin/sh\n{bus}HOME={} exec /usr/bin/xdg-open \"$@\" >/dev/null 2>&1 &\n",
-            quote(&real_home)
-        );
-        if std::fs::write(&shim, script).is_ok() {
-            #[cfg(unix)]
-            {
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(["-p", "/usage"])
+        .envs(setup::child_env())
+        .envs(setup::staged_home_env(&dest))
+        // Pin agy to write/read the token file in `dest` rather than reusing
+        // the ambient OS credential store (Windows Credential Manager / macOS
+        // Keychain / Linux keyring), which would exit 0 with no token file.
+        .envs([
+            setup::keyring_off(&dest),
+            (setup::FILE_TOKEN_STORAGE.to_string(), "1".to_string()),
+        ])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    #[cfg(unix)]
+    let shim = {
+        let real_home = std::env::var("HOME").unwrap_or_default();
+        let shim = dest.join("xdg-open");
+        if !real_home.is_empty() {
+            let quote = |v: &str| format!("'{}'", v.replace('\'', "'\''"));
+            let bus = match std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+                Ok(v) if !v.is_empty() => {
+                    format!("export DBUS_SESSION_BUS_ADDRESS={}\n", quote(&v))
+                }
+                _ => "unset DBUS_SESSION_BUS_ADDRESS\n".to_string(),
+            };
+            let script = format!(
+                "#!/bin/sh\n{bus}HOME={} exec /usr/bin/xdg-open \"$@\" >/dev/null 2>&1 &\n",
+                quote(&real_home)
+            );
+            if std::fs::write(&shim, script).is_ok() {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755));
             }
         }
-    }
-    let path_env = format!(
-        "{}:{}",
-        dest.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let mut cmd = std::process::Command::new(&binary);
-    cmd.args(["-p", "/usage"])
-        .envs(setup::child_env())
-        .env("HOME", &dest)
-        .env("PATH", path_env)
-        .env("BROWSER", &shim)
-        .envs([setup::keyring_off(&dest)])
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    if std::env::var_os("XAUTHORITY").is_none() && !real_home.is_empty() {
-        let xauth = Path::new(&real_home).join(".Xauthority");
-        if xauth.is_file() {
-            cmd.env("XAUTHORITY", xauth);
+        let path_env = format!(
+            "{}:{}",
+            dest.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        cmd.env("PATH", path_env).env("BROWSER", &shim);
+        if std::env::var_os("XAUTHORITY").is_none() && !real_home.is_empty() {
+            let xauth = Path::new(&real_home).join(".Xauthority");
+            if xauth.is_file() {
+                cmd.env("XAUTHORITY", xauth);
+            }
         }
-    }
+        shim
+    };
     let placed = cmd
         .status()
         .map_err(|e| format!("spawn agy: {e}"))
@@ -922,6 +931,7 @@ fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, Str
                 Err(format!("agy sign-in failed (exited {s})"))
             }
         });
+    #[cfg(unix)]
     let _ = std::fs::remove_file(&shim);
     if let Err(e) = placed {
         let _ = std::fs::remove_dir_all(&dest);
