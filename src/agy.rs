@@ -398,12 +398,15 @@ impl Driver for AgyDriver {
         let pick = accounts::pick_for(&prep.model)?;
         let account_home = pick.as_ref().and_then(|p| p.home.clone());
         let token = match account_home.as_deref() {
-            Some(home) => Some(use_token(Some(home)).ok_or_else(|| {
-                format!(
-                    "the picked antigravity account has no login in {}",
-                    home.display()
-                )
-            })?),
+            Some(home) => match use_token(Some(home)) {
+                None if accounts::requires_file_login(home) => {
+                    return Err(format!(
+                        "the picked antigravity account has no login in {}",
+                        home.display()
+                    ));
+                }
+                login => login,
+            },
             None if !has_auth_store() => return Err(setup::LOGIN_HINT.to_string()),
             None => credential_file(),
         };

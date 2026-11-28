@@ -438,13 +438,8 @@ pub fn serving() -> Serving {
     serve(&load())
 }
 
-/// Why `home` cannot serve the account expecting `want`, or `None` when it
-/// can. Only a home staged under `homes/` is pinned to a token file; any
-/// other home (the user's own) may keep its login in the OS credential
-/// store, as the Windows build always does, so a missing file there proves
-/// nothing and `agy` itself is left to answer.
-fn login_problem(home: &Path, want: &str, staged: bool) -> Option<String> {
-    if token_of(home).is_none() && !staged {
+fn login_problem(home: &Path, want: &str, requires_file: bool) -> Option<String> {
+    if token_of(home).is_none() && !requires_file {
         return None;
     }
     match identity_of(home) {
@@ -457,13 +452,18 @@ fn login_problem(home: &Path, want: &str, staged: bool) -> Option<String> {
     }
 }
 
-fn is_staged(home: &Path) -> bool {
-    homes_dir().is_some_and(|d| home.starts_with(d))
+pub(crate) fn requires_file_login(home: &Path) -> bool {
+    !setup::home_dir().is_some_and(|own| {
+        own == home
+            || own
+                .canonicalize()
+                .is_ok_and(|own| home.canonicalize().is_ok_and(|home| own == home))
+    })
 }
 
 fn problem_of(a: &Account) -> Option<String> {
     let home = spawn_home(&a.home)?;
-    login_problem(home, a.email.as_deref()?, is_staged(home))
+    login_problem(home, a.email.as_deref()?, requires_file_login(home))
 }
 
 /// A signed-out account is never picked, so `verify` never sees it again
