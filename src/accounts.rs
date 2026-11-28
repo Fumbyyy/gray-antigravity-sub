@@ -438,23 +438,54 @@ pub fn serving() -> Serving {
     serve(&load())
 }
 
-fn verify(p: &Pick) -> Result<(), String> {
-    let want = load()
-        .accounts
-        .iter()
-        .find(|a| a.label == p.label)
-        .and_then(|a| a.email.clone());
-    let Some((home, want)) = p.home.as_deref().zip(want) else {
-        return Ok(());
-    };
-    let problem = match identity_of(home) {
+/// Why `home` cannot serve the account expecting `want`, or `None` when it
+/// can. Only a home staged under `homes/` is pinned to a token file; any
+/// other home (the user's own) may keep its login in the OS credential
+/// store, as the Windows build always does, so a missing file there proves
+/// nothing and `agy` itself is left to answer.
+fn login_problem(home: &Path, want: &str, staged: bool) -> Option<String> {
+    if token_of(home).is_none() && !staged {
+        return None;
+    }
+    match identity_of(home) {
         None => Some(format!("signed out: no login in {}", home.display())),
-        Some(got) if !got.eq_ignore_ascii_case(&want) => Some(format!(
+        Some(got) if !got.eq_ignore_ascii_case(want) => Some(format!(
             "signed out: {} is logged in as {got}, not {want}",
             home.display()
         )),
         Some(_) => None,
+    }
+}
+
+fn is_staged(home: &Path) -> bool {
+    homes_dir().is_some_and(|d| home.starts_with(d))
+}
+
+fn problem_of(a: &Account) -> Option<String> {
+    let home = spawn_home(&a.home)?;
+    login_problem(home, a.email.as_deref()?, is_staged(home))
+}
+
+/// A signed-out account is never picked, so `verify` never sees it again
+/// and a fresh `agy` login could not clear the mark. Re-check them (file
+/// reads only) before serving.
+fn revive_signed_out() {
+    let _ = mutate(|store| {
+        for a in &mut store.accounts {
+            if matches!(a.health, Health::SignedOut { .. }) && problem_of(a).is_none() {
+                a.health = Health::Ready;
+            }
+        }
+        Ok(())
+    });
+}
+
+fn verify(p: &Pick) -> Result<(), String> {
+    let store = load();
+    let Some(a) = store.accounts.iter().find(|a| a.label == p.label) else {
+        return Ok(());
     };
+    let problem = problem_of(a);
     let _ = mutate(|store| {
         if let Some(a) = store.accounts.iter_mut().find(|a| a.label == p.label) {
             match (&problem, &a.health) {
@@ -478,6 +509,7 @@ pub fn pick_for(model: &str) -> Result<Option<Pick>, String> {
     if n == 0 {
         return Ok(None);
     }
+    revive_signed_out();
     for _ in 0..=n {
         match serve_for(&load(), &groups) {
             Serving::Account(p) if verify(&p).is_err() => {}
@@ -1095,6 +1127,7 @@ fn account_line(a: &Account, now: u64, selected: &Option<String>) -> String {
 }
 
 fn cmd_list(json: bool) -> Result<String, String> {
+    revive_signed_out();
     let store = load_checked()?;
     if json {
         return store_json(&store);
@@ -1244,4 +1277,45 @@ fn cmd_usage(args: &[String], json: bool) -> Result<String, String> {
         .map(usage_text)
         .collect::<Vec<_>>()
         .join("\n\n"))
+}
+
+#[cfg(test)]
+mod login_tests {
+    use super::login_problem;
+
+    fn home_with_token(email: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join(".gemini").join("antigravity-cli");
+        std::fs::create_dir_all(&cli).unwrap();
+        let doc = match email {
+            Some(e) => serde_json::json!({ "id_token_email": e }),
+            None => serde_json::json!({}),
+        };
+        std::fs::write(cli.join("antigravity-oauth-token"), doc.to_string()).unwrap();
+        dir
+    }
+
+    #[test]
+    fn own_home_without_token_file_is_not_signed_out() {
+        // The Windows build keeps the login in Credential Manager: no file.
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(login_problem(home.path(), "a@x.com", false), None);
+    }
+
+    #[test]
+    fn staged_home_without_token_file_is_signed_out() {
+        let home = tempfile::tempdir().unwrap();
+        let msg = login_problem(home.path(), "a@x.com", true).unwrap();
+        assert!(msg.starts_with("signed out: no login in"), "{msg}");
+    }
+
+    #[test]
+    fn token_identity_is_checked_in_any_home() {
+        for staged in [false, true] {
+            let home = home_with_token(Some("A@x.com"));
+            assert_eq!(login_problem(home.path(), "a@x.com", staged), None);
+            let msg = login_problem(home.path(), "b@x.com", staged).unwrap();
+            assert!(msg.contains("logged in as A@x.com, not b@x.com"), "{msg}");
+        }
+    }
 }
